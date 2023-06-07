@@ -4,13 +4,16 @@
   "description": "A simple client and homekit adapter for Electra ACs",
   "main": "index.js",
   "scripts": {
-      "test": "echo \"Error: no test specified\" && exit 1",
-      "format": "f -w",
-      "format:check": "f"
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "format": "f -w",
+    "format:check": "f"
   },
   "author": "",
   "license": "ISC",
   "devDependencies": {
     "@magic/format": "^0.0.51"
+  },
+  "dependencies": {
+    "axios": "^1.4.0"
   }
 }
