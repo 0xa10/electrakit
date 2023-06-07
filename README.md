@@ -325,3 +325,28 @@ Response (full)
   }
 }
 ```
+
+# Design
+Adapter is a Dockerized program, that takes as input a token and imei, as well as an id of the air conditioner to control.
+
+It has a post helper function, which ensures a valid SID is issued.
+It does so by first checking if a sid is available, and if not, issuing one using VALIDATE_TOKEN
+
+If a post fails under certain conditions - it will erase the older SID and retry.
+A second failure will cause it to panic.
+
+Upon initializing, it will first fetch a list of devices.
+
+It will then choose the device with the given id. If the ID does not exist, it will panic.
+
+Once the device is chosen, its current telemetry values (OPER and DIAG_L2) will be fetched as a part of the updateState method
+
+This state, along with an associated timestamp will be saved.
+
+two state access functions will be provided
+1. getState - returns the current state, regardless of age.
+1. getCurrentState - If the current state is stale (by age), updateState will be called first followed by getState
+
+Whenever the state is updated, using setState - the new state will first be sent usind SEND_COMMAND, and then read back using updateState, and asserted to match.
+
+In terms of specific utility functions (turn on/off, set temp, etc) - these will all be conducted on a copy of the state 
