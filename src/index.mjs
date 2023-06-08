@@ -183,13 +183,16 @@ class Waker {
 }
 
 class ElectraAC {
-  constructor(client, deviceId, stale_duration = 1000) {
+  constructor(client, deviceId, stale_duration = 1000, syncInterval = 5000) {
     this.client = client
     this.deviceId = deviceId
 
     this.state = null
     this.expiration = null
     this.stale_duration = stale_duration
+
+
+    this.syncInterval = syncInterval
 
     this.pending_changes = {}
     this.pending_changes_mutex = new Mutex() // This is probably not necessary in JS, but easier than finding out
@@ -254,7 +257,7 @@ class ElectraAC {
         }
         console.log('Sending command')
         await this.sendCommand(newState)
-        await sleep(5000)
+        await sleep(this.syncInterval)
       }
     }
   }
