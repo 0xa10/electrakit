@@ -204,14 +204,16 @@ class ElectraAC {
     })
   }
 
+  // Get the current state, or update it if its stale. Force invalidate if requested
   async getState(invalidate = false) {
     if (invalidate) {
-      return await this.update()
+      return await this.updateState()
     } else {
-      return this.state ?? (await this.update())
+      return this.state ?? (await this.updateState())
     }
   }
 
+  // Set the local state, and start a timer to invalidate it
   setState(newState) {
     this.state = newState
     clearTimeout(this.staleTimer)
@@ -221,6 +223,17 @@ class ElectraAC {
     }, this.stale_duration)
   }
 
+  // Read a new state from the server and update the local state
+  async updateState() {
+    let upstreamState = await this.client.getLastTelemetry(this.deviceId)
+    console.log('Updating state')
+    console.log(upstreamState)
+    this.setState(upstreamState)
+    return this.state
+  }
+
+  // The sync task loops on any queued changes, and applies them to the device
+  // When done, it goes to sleep until awoken by queueChanges
   async syncTask() {
     while (true) {
       // Ideally - condition on some member so we can "cancel" this loop
@@ -231,14 +244,15 @@ class ElectraAC {
         let newState = await this.getState(true) // Get a copy of the uncached state
         const release = await this.pending_changes_mutex.acquire()
         try {
+          // Check if there are any changes to apply
           const change_count = Object.keys(this.pending_changes).length
           if (change_count === 0) {
-            console.warn('syncTask called with no pending changes')
+            console.warn('syncTask called with no pending changes') // This shouldnt happen is everything is working properly
             break
           }
           console.log(`Pending changes: ${JSON.stringify(this.pending_changes)}`)
 
-          // Clear any that have been commited upstream
+          // Clear any keys that have been commited upstream succesfully
           for (const key of Object.keys(this.pending_changes)) {
             if (newState.OPER[key] === this.pending_changes[key]) {
               console.log(`Update confirmed to ${key}`)
@@ -262,14 +276,7 @@ class ElectraAC {
     }
   }
 
-  async update() {
-    let upstreamState = await this.client.getLastTelemetry(this.deviceId)
-    console.log('Updating state')
-    console.log(upstreamState)
-    this.setState(upstreamState)
-    return this.state
-  }
-
+  // Queue an incremental change to OPER
   async queueChange(oper_delta) {
     const release = await this.pending_changes_mutex.acquire()
     console.log('updating pending')
@@ -279,6 +286,7 @@ class ElectraAC {
     await this.pending_changes_waker.wake()
   }
 
+  // Send an updated OPER state
   async sendCommand(newState) {
     const payload = {
       pvdid: 1,
@@ -304,7 +312,6 @@ class ElectraAC {
     }
   }
 
-  // Status
   async isOn() {
     return (await this.getMode()) !== 'STBY'
   }
@@ -329,7 +336,6 @@ class ElectraAC {
     await this.setMode('STBY')
   }
 
-  // Target temperature
   async setTargetTemperature(temp) {
     console.log('Setting target temperature to ' + temp)
     if (temp < 16 || temp > 30) {
@@ -364,14 +370,6 @@ class ElectraAC {
 
     await this.queueChange({ FANSPD: speed })
   }
-
-  // So the electra server cannot handle multiple requests in quick succession - any commands sent before
-  // a previous one "completed" will be thrown out. Even on the app, for instance if you click "on" and then
-  // raise the temperature, the temperature change will be ignored.
-  // Two possible solutions:
-  // 1. Simple approach - whenever sending a command, poll the server until the state changes confirming
-  // the change was accepted.
-  // 2. When a command is sent, it queues up
 }
 
 async function main() {
