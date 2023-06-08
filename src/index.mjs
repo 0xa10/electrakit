@@ -1,5 +1,6 @@
 import fs from 'fs/promises';
 import axios from 'axios';
+import {Mutex, } from 'async-mutex';
 
 
 const BASE_URL = "https://app.ecpiot.co.il/";
@@ -44,6 +45,8 @@ class ElectraClient {
 
         this.sid = null;
         this.devices = null;
+
+        this.retry = true;
     }
 
     async getDevices() { 
@@ -54,7 +57,13 @@ class ElectraClient {
             sid: this.sid ?? await this.renewSid()
         }
         let res = await this.api.post("mobile/mobilecommand", payload)
-
+        
+        if (this.retry && res.data.status !== 0) {
+            // If we failed to get devices, renew sid and retry
+            payload.sid = await this.renewSid();
+            res = await this.api.post("mobile/mobilecommand", payload)
+        }
+            
         if (res.data.status !== 0) {
             console.error(res);
             throw new GetDevicesError("Failed to get devices");
@@ -80,6 +89,12 @@ class ElectraClient {
             sid: this.sid ?? await this.renewSid()
         }
         let res = await this.api.post("mobile/mobilecommand", payload)
+
+        if (this.retry && res.data.status !== 0) {
+            // If we failed to get devices, renew sid and retry
+            payload.sid = await this.renewSid();
+            res = await this.api.post("mobile/mobilecommand", payload)
+        }
 
         if (res.data.status !== 0) {
             throw new GetLastTelemetryError("Failed to get devices");
@@ -118,8 +133,6 @@ class ElectraClient {
         };
 
         let res = await this.api.post("mobile/mobilecommand", payload)
-        console.log(res.data);
-        console.log(res);
         
         const newSid = res.data.data?.sid; 
         if (newSid === undefined) {
@@ -143,6 +156,33 @@ class ElectraClient {
     }
 }
 
+function sleep(ms) {
+    return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+// Hacked together event so we can wake the sync task when needed
+// Do not use this for anything other than waking one waiter, its not a replacement for condvar or a real event
+class Waker {
+    constructor() {
+        this.alice = new Mutex()
+        this.bob = new Mutex()
+        this.alice.acquire();
+    }
+
+    async wake() {
+        // Wake should be rentrant
+        await this.alice.release();
+        await this.bob.waitForUnlock();
+        await this.alice.acquire();
+    }
+
+    async wait() {
+        const release = await this.bob.acquire();
+        await this.alice.waitForUnlock();
+        release();
+    }
+}
+    
 
 class ElectraAC {
     constructor(client, deviceId, stale_duration = 1000) {
@@ -152,27 +192,90 @@ class ElectraAC {
         this.state = null;
         this.expiration = null;
         this.stale_duration = stale_duration;
+
+        this.pending_changes = {}
+        this.pending_changes_mutex = new Mutex(); // This is probably not necessary in JS, but easier than finding out
+        this.pending_changes_waker = new Waker();
+
+        // Start background task for applying changes
+        process.nextTick(() => {
+            this.syncTask(); 
+        });
+    } 
+
+    async getState(invalidate = false) {
+        if (invalidate) {
+            return await this.update();
+        } else {
+            return this.state ?? await this.update();
+        }
     }
 
-    async getState() {
-        return this.state ?? await this.update();
-    }
 
-
-    invalidateState() {
-        // Call this after initiating a state change
-        this.state = null;
+    setState(newState) {
+        this.state = newState;
         clearTimeout(this.staleTimer);
-    }
-    
-
-    async update() {
-        console.log("Updating state");
-        this.state = await this.client.getLastTelemetry(this.deviceId);
         this.staleTimer = setTimeout(() => {
             this.state = null;
+            console.trace("State expired");
         }, this.stale_duration);
+    }
+    
+    async syncTask() {
+        while (true) { // Ideally - condition on some member so we can "cancel" this loop
+            await this.pending_changes_waker.wait(); // First wait for wakeup
+            console.trace("syncTask woke up");
+            while (true) { // We break out when we have no pending changes
+                let newState = await this.getState(true); // Get a copy of the uncached state
+                const release = await this.pending_changes_mutex.acquire();
+                try {
+                    const change_count = Object.keys(this.pending_changes).length;
+                    if (change_count === 0) {
+                        console.warn("syncTask called with no pending changes");
+                        break;
+                    }
+                    console.log(`Pending changes: ${JSON.stringify(this.pending_changes)}`);
+
+                    // Clear any that have been commited upstream
+                    for (const key of Object.keys(this.pending_changes)) {
+                        if (newState.OPER[key] === this.pending_changes[key]) {
+                            console.log(`Update confirmed to ${key}`);
+                            delete this.pending_changes[key];
+                        }
+                    }
+                    if (Object.keys(this.pending_changes).length === 0) {
+                        console.log("All changes applied");
+                        break;
+                    }
+                    // Apply remaining changes
+                    console.log(`Applying changes ${JSON.stringify(this.pending_changes)}`);
+                    newState.OPER = {...newState.OPER, ...this.pending_changes}; 
+                }
+                finally {
+                    release();
+                }
+                console.log("Sending command");
+                await this.sendCommand(newState);
+                await sleep(5000); 
+            }
+        }
+    }
+
+    async update() {
+        let upstreamState = await this.client.getLastTelemetry(this.deviceId);
+        console.log("Updating state");
+        console.log(upstreamState);
+        this.setState(upstreamState);
         return this.state;
+    }
+
+    async queueChange(oper_delta) {
+        const release = await this.pending_changes_mutex.acquire();
+        console.log("updating pending")
+        this.pending_changes = {...this.pending_changes, ...oper_delta};
+        release();
+        console.log("calling wake")
+        await this.pending_changes_waker.wake();
     }
 
     async sendCommand(newState) {
@@ -187,6 +290,13 @@ class ElectraAC {
             }
         }
         let res = await this.client.api.post("mobile/mobilecommand", payload)
+
+        if (this.retry && res.data.status !== 0) {
+            // If we failed to get devices, renew sid and retry
+            payload.sid = await this.renewSid();
+            res = await this.api.post("mobile/mobilecommand", payload)
+        }
+
         if (res.data.status !== 0) {
             console.error(res);
             throw new SetOperError("Send Command failed");
@@ -206,21 +316,12 @@ class ElectraAC {
 
     async setMode(mode) {
         console.log("Setting mode to " + mode);
-        if (mode !== "COOL" && mode !== "HEAT" && mode !== "STBY") {
+        if (mode !== "COOL" && mode !== "HEAT" && mode !== "STBY" && mode !== "DRY") {
             /// TODO - support other modes? DRY, FAN, AUTO
             throw new SetOperError(`Tried to set invalid AC mode: ${mode}`);
         }
-
-        let state = await this.getState();
-
-        if (state.OPER?.AC_MODE === mode) {
-            console.warn("AC is already on and in chosen mode, proceeding anyway"); 
-        }
-
-        let newState = state;
-        newState.OPER.AC_MODE = mode;
     
-        await this.sendCommand(newState);
+        await this.queueChange({"AC_MODE": mode});
     }
 
     async turnOff() {
@@ -234,15 +335,7 @@ class ElectraAC {
             throw new SetOperError(`Tried to set invalid temperature: ${temp}`);
         }
 
-        let state = await this.getState();
-        if (state.OPER?.SPT === temp) {
-            console.warn("AC is already on and at chosen temperature, proceeding anyway"); 
-        }
-
-        let newState = state;
-        newState.OPER.SPT = temp;
-        
-        await this.sendCommand(newState);
+        await this.queueChange({"SPT": temp.toString()});
     }
 
     async getTargetTemperature() {
@@ -267,17 +360,17 @@ class ElectraAC {
         if (speed !== "AUTO" && speed !== "LOW" && speed !== "MED" && speed !== "HIGH") {
             throw new SetOperError(`Tried to set invalid fan speed: ${speed}`);
         }
-
-        let state = await this.getState();
-        if (state.OPER?.FANSPD === speed) {
-            console.warn("AC is already on and in chosen fan speed, proceeding anyway"); 
-        }
-
-        let newState = state;
-        newState.OPER.FANSPD = mode;
     
-        await this.sendCommand(newState);
+        await this.queueChange({"FANSPD": speed});
     }
+
+    // So the electra server cannot handle multiple requests in quick succession - any commands sent before
+    // a previous one "completed" will be thrown out. Even on the app, for instance if you click "on" and then
+    // raise the temperature, the temperature change will be ignored.
+    // Two possible solutions:
+    // 1. Simple approach - whenever sending a command, poll the server until the state changes confirming
+        // the change was accepted. 
+    // 2. When a command is sent, it queues up
 }
 
 async function main() {
@@ -295,23 +388,22 @@ async function main() {
     }
     let ac = await client.selectDevice(171451)
 
-    function sleep(time) {
-        return new Promise(resolve => setTimeout(resolve, time));
-    }
-
-    for (let i = 0; i < 0; i++) {
-        await sleep(1000);
-        console.log(i);
-        console.log(await ac.getState())
-    }
-
     console.log("Current temp is: " + await ac.getCurrentTemperature());
     console.log("Target temp is: " + await ac.getTargetTemperature());
-    if (await ac.isOn()) {
-        console.log("AC is on, turning off");
-        await ac.turnOff();
-    }
+    console.log("Fan speed is: " + await ac.getFanSpeed());
+    await sleep(30000)
+    console.log("************** AC is off, turning on and setting to med fan, 21 degrees");
+    await ac.setTargetTemperature(21);
+    await sleep(6000)
+    await ac.setMode("COOL");
+    await ac.setFanSpeed("MED");
+    await sleep(30000)
+    console.log("************** AC is off, turning on and setting to dry auto fan, 23 degrees");
+    await ac.setTargetTemperature(23);
+    await ac.setFanSpeed("AUTO");
+    await sleep(30000)
+    console.log("************** AC is on, turning off");
+    await ac.turnOff();
 }
 
-// only run if this file is the main file
 await main()
