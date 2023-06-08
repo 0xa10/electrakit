@@ -1,6 +1,7 @@
 import fs from 'fs/promises'
 import axios from 'axios'
 import { Mutex } from 'async-mutex'
+import { EventEmitter } from 'events'
 
 const BASE_URL = 'https://app.ecpiot.co.il/'
 
@@ -159,26 +160,20 @@ function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms))
 }
 
-// Hacked together event so we can wake the sync task when needed
-// Do not use this for anything other than waking one waiter, its not a replacement for condvar or a real event
 class Waker {
   constructor() {
-    this.alice = new Mutex()
-    this.bob = new Mutex()
-    this.alice.acquire()
+    // TODO - replace with eventemitter design
+    this._event_emitter = new EventEmitter()
   }
 
   async wake() {
-    // Wake should be rentrant
-    await this.alice.release()
-    await this.bob.waitForUnlock()
-    await this.alice.acquire()
+    this._event_emitter.emit('wake')
   }
 
   async wait() {
-    const release = await this.bob.acquire()
-    await this.alice.waitForUnlock()
-    release()
+    await new Promise(resolve => {
+        this._event_emitter.once('wake', resolve)
+    })
   }
 }
 
