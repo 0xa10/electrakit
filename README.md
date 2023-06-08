@@ -1,4 +1,5 @@
 # API research
+
 Most of my research is based on the code in https://github.com/yonatanp/electrasmart and https://github.com/nitaybz/homebridge-electra-smart.
 
 Few things I noticed along the way - pvdid and id are optional in most requests. Not sure what pvdid is but id seems to be just a handle so we can associate reponses with requests.
@@ -6,14 +7,18 @@ Few things I noticed along the way - pvdid and id are optional in most requests.
 All requests should be issued the the User-Agent set to `Electra Client`, to base url `https://app.ecpiot.co.il/mobile/mobilecommand`
 
 # IMEI
+
 The IMEI needs to be in the format:
+
 ```
 2b950000 + [random sequence of 8 digits]
 ```
 
 # Token
+
 To generate a token, you must authenticate using OTP.
 First you send:
+
 ```
 {
     'pvdid': 1,
@@ -25,8 +30,8 @@ First you send:
 }
 ```
 
-
 When the OTP arrives, you send it back:
+
 ```
 {
     'pvdid': 1,
@@ -40,11 +45,13 @@ When the OTP arrives, you send it back:
         'osver': 'M4B30Z'
 }
 ```
+
 The token will be returned at this point.
 
-
 # SID
+
 To acquire a session id, you need the imei and token:
+
 ```
 {
     'pvdid': 1,
@@ -61,7 +68,9 @@ To acquire a session id, you need the imei and token:
 The SID is valid for 1 hour, and should be cached.
 
 # Listing devices
+
 To list devices, you must have a valid SID
+
 ```
 {
     'pvdid': 1,
@@ -70,10 +79,13 @@ To list devices, you must have a valid SID
     'sid': [sid]
 }
 ```
+
 Each devices has an id, mac address, serial number, device name and type
 
 # Device telemetry
+
 To fetch the current device state, you must have a valid sid
+
 ```
 {
     'pvdid': 1,
@@ -86,10 +98,13 @@ To fetch the current device state, you must have a valid sid
     }
 }
 ```
+
 The object returned should have all the current AC state characteristics.
 
 # Updating the state
-To update the state, send the following 
+
+To update the state, send the following
+
 ```
 {
     'pvdid': 1,
@@ -102,12 +117,15 @@ To update the state, send the following
     }
 }
 ```
+
 OPER['AC_STSRC'] must always be set to `WI-FI`
 
-
 # Request response examples
+
 ## SEND_OTP
+
 Request:
+
 ```bash
 curl -X POST \
   -H "Content-Type: application/json" \
@@ -125,6 +143,7 @@ curl -X POST \
 ```
 
 Response:
+
 ```json
 {
   "id": 99,
@@ -138,7 +157,9 @@ Response:
 ```
 
 ## CHECK_OTP
+
 Request:
+
 ```bash
 curl -X POST \
   -H "Content-Type: application/json" \
@@ -159,6 +180,7 @@ curl -X POST \
 ```
 
 Response:
+
 ```json
 {
   "id": 99,
@@ -171,11 +193,12 @@ Response:
     "res_desc": null
   }
 }
-
 ```
 
 ## VALIDATE_TOKEN
+
 Request:
+
 ```bash
 curl -X POST \
   -H "Content-Type: application/json" \
@@ -195,6 +218,7 @@ curl -X POST \
 ```
 
 Response:
+
 ```json
 {
   "id": 99,
@@ -209,7 +233,9 @@ Response:
 ```
 
 ## GET_DEVICES
+
 Request:
+
 ```bash
 curl -X POST \
   -H "Content-Type: application/json" \
@@ -222,6 +248,7 @@ curl -X POST \
 ```
 
 Response:
+
 ```json
 {
   "id": 99,
@@ -271,8 +298,11 @@ Response:
   }
 }
 ```
+
 ## GET_LAST_TELEMETRY
+
 Request:
+
 ```bash
 curl -X POST \
   -H "Content-Type: application/json" \
@@ -291,6 +321,7 @@ curl -X POST \
 ```
 
 Response (just OPER):
+
 ```json
 {
   "id": 99,
@@ -308,6 +339,7 @@ Response (just OPER):
 ```
 
 Response (full)
+
 ```json
 {
   "id": 99,
@@ -327,6 +359,7 @@ Response (full)
 ```
 
 # Design
+
 Adapter is a Dockerized program, that takes as input a token and imei, as well as an id of the air conditioner to control.
 
 It has a post helper function, which ensures a valid SID is issued.
@@ -344,9 +377,10 @@ Once the device is chosen, its current telemetry values (OPER and DIAG_L2) will 
 This state, along with an associated timestamp will be saved.
 
 two state access functions will be provided
+
 1. getState - returns the current state, regardless of age.
 1. getCurrentState - If the current state is stale (by age), updateState will be called first followed by getState
 
 Whenever the state is updated, using setState - the new state will first be sent usind SEND_COMMAND, and then read back using updateState, and asserted to match.
 
-In terms of specific utility functions (turn on/off, set temp, etc) - these will all be conducted on a copy of the state 
+In terms of specific utility functions (turn on/off, set temp, etc) - these will all be conducted on a copy of the state
