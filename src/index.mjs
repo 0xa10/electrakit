@@ -172,7 +172,7 @@ class Waker {
 
   async wait() {
     await new Promise(resolve => {
-        this._event_emitter.once('wake', resolve)
+      this._event_emitter.once('wake', resolve)
     })
   }
 }
@@ -185,7 +185,6 @@ class ElectraAC {
     this.state = null
     this.expiration = null
     this.stale_duration = stale_duration
-
 
     this.syncInterval = syncInterval
 
