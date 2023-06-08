@@ -25,6 +25,13 @@ class DeviceError extends Error {
     }
 }
 
+class SetOperError extends Error {
+    constructor(message) {
+        super(message);
+        this.name = "SetOperError";
+    }
+}
+
 class ElectraClient {
 	constructor(token, imei) {
         this.token = token;
@@ -49,6 +56,7 @@ class ElectraClient {
         let res = await this.api.post("mobile/mobilecommand", payload)
 
         if (res.data.status !== 0) {
+            console.error(res);
             throw new GetDevicesError("Failed to get devices");
         }
 
@@ -77,13 +85,21 @@ class ElectraClient {
             throw new GetLastTelemetryError("Failed to get devices");
         }
 
-        let telemetry = res.data.data?.commandJson?.OPER;
-        if (telemetry === undefined) {
-            throw new GetLastTelemetryError("Unexpected response from server");
+        let oper = res.data.data?.commandJson?.OPER;
+        if (oper === undefined) {
+            throw new GetLastTelemetryError("Unexpected response from server when parsing OPER object");
+        }
+
+        let diag_l2 = res.data.data?.commandJson?.DIAG_L2;
+        if (diag_l2 === undefined) {
+            throw new GetLastTelemetryError("Unexpected response from server when parsing DIAG_L2 object");
         }
         try {
-            return JSON.parse(telemetry);
+            let oper_parsed = JSON.parse(oper); 
+            let diag_l2_parsed = JSON.parse(diag_l2);
+            return {OPER: oper_parsed.OPER, DIAG_L2: diag_l2_parsed.DIAG_L2};
         } catch (e) {
+            console.error(e);
             throw new GetLastTelemetryError("Failed to response");
         }   
     }
@@ -159,7 +175,109 @@ class ElectraAC {
         return this.state;
     }
 
+    async sendCommand(newState) {
+        const payload = {
+            pvdid: 1,
+            id: 1000,
+            cmd: 'SEND_COMMAND',
+            sid: this.client.sid ?? await this.client.renewSid(),
+            data: {
+                id: this.deviceId,
+                commandJson: JSON.stringify({OPER: newState.OPER}), // Send only OPER
+            }
+        }
+        let res = await this.client.api.post("mobile/mobilecommand", payload)
+        if (res.data.status !== 0) {
+            console.error(res);
+            throw new SetOperError("Send Command failed");
+        }
+    }
+
+    // Status
+    async isOn() {
+        return await this.getMode() !== "STBY";
+    }
+
+    async getMode() {
+        let state = await this.getState();
+         
+        return state.OPER?.AC_MODE;
+    }
+
+    async setMode(mode) {
+        console.log("Setting mode to " + mode);
+        if (mode !== "COOL" && mode !== "HEAT" && mode !== "STBY") {
+            /// TODO - support other modes? DRY, FAN, AUTO
+            throw new SetOperError(`Tried to set invalid AC mode: ${mode}`);
+        }
+
+        let state = await this.getState();
+
+        if (state.OPER?.AC_MODE === mode) {
+            console.warn("AC is already on and in chosen mode, proceeding anyway"); 
+        }
+
+        let newState = state;
+        newState.OPER.AC_MODE = mode;
     
+        await this.sendCommand(newState);
+    }
+
+    async turnOff() {
+        await this.setMode("STBY");
+    }
+    
+    // Target temperature
+    async setTargetTemperature(temp) {
+        console.log("Setting target temperature to " + temp);
+        if (temp < 16 || temp > 30) {
+            throw new SetOperError(`Tried to set invalid temperature: ${temp}`);
+        }
+
+        let state = await this.getState();
+        if (state.OPER?.SPT === temp) {
+            console.warn("AC is already on and at chosen temperature, proceeding anyway"); 
+        }
+
+        let newState = state;
+        newState.OPER.SPT = temp;
+        
+        await this.sendCommand(newState);
+    }
+
+    async getTargetTemperature() {
+        let state = await this.getState();
+        return state.OPER?.SPT;
+    }
+
+    // Current temperature
+    async getCurrentTemperature() {
+        let state = await this.getState();
+        return state.DIAG_L2?.I_CALC_AT; // Use this over I_ICT or I_RAT?
+    }
+    
+    // Fan speed
+    async getFanSpeed() {
+        let state = await this.getState();
+        return state.OPER?.FANSPD;
+    }
+
+    async setFanSpeed(speed) {
+        console.log("Setting fan speed to " + speed);
+        if (speed !== "AUTO" && speed !== "LOW" && speed !== "MED" && speed !== "HIGH") {
+            throw new SetOperError(`Tried to set invalid fan speed: ${speed}`);
+        }
+
+        let state = await this.getState();
+        if (state.OPER?.FANSPD === speed) {
+            console.warn("AC is already on and in chosen fan speed, proceeding anyway"); 
+        }
+
+        let newState = state;
+        newState.OPER.FANSPD = mode;
+    
+        await this.sendCommand(newState);
+    }
 }
 
 async function main() {
@@ -181,10 +299,17 @@ async function main() {
         return new Promise(resolve => setTimeout(resolve, time));
     }
 
-    for (let i = 0; i < 10; i++) {
+    for (let i = 0; i < 0; i++) {
         await sleep(1000);
         console.log(i);
         console.log(await ac.getState())
+    }
+
+    console.log("Current temp is: " + await ac.getCurrentTemperature());
+    console.log("Target temp is: " + await ac.getTargetTemperature());
+    if (await ac.isOn()) {
+        console.log("AC is on, turning off");
+        await ac.turnOff();
     }
 }
 
