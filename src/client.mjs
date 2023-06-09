@@ -3,35 +3,9 @@ import axios from 'axios'
 import { Mutex } from 'async-mutex'
 import { EventEmitter } from 'events'
 
+import './error.mjs'
+
 const BASE_URL = 'https://app.ecpiot.co.il/'
-
-class GetDevicesError extends Error {
-  constructor(message) {
-    super(message)
-    this.name = 'GetDevicesError'
-  }
-}
-
-class GetLastTelemetryError extends Error {
-  constructor(message) {
-    super(message)
-    this.name = 'GetLastTelemetryError'
-  }
-}
-
-class DeviceError extends Error {
-  constructor(message) {
-    super(message)
-    this.name = 'DeviceError'
-  }
-}
-
-class SetOperError extends Error {
-  constructor(message) {
-    super(message)
-    this.name = 'SetOperError'
-  }
-}
 
 class ElectraClient {
   constructor(token, imei) {
@@ -152,7 +126,7 @@ class ElectraClient {
     }
     console.log(device)
 
-    return new ElectraAC(this, deviceId)
+    return new ElectraAC(this, deviceId, device.sn, device.mac)
   }
 }
 
@@ -160,27 +134,13 @@ function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms))
 }
 
-class Waker {
-  constructor() {
-    // TODO - replace with eventemitter design
-    this._event_emitter = new EventEmitter()
-  }
-
-  async wake() {
-    this._event_emitter.emit('wake')
-  }
-
-  async wait() {
-    await new Promise(resolve => {
-      this._event_emitter.once('wake', resolve)
-    })
-  }
-}
-
 class ElectraAC {
-  constructor(client, deviceId, stale_duration = 1000, syncInterval = 5000) {
+  constructor(client, deviceId, serialNumber, macAddress, stale_duration = 5000, syncInterval = 5000) {
     this.client = client
     this.deviceId = deviceId
+
+    this.serialNumber = serialNumber
+    this.macAddress = macAddress
 
     this.state = null
     this.expiration = null
@@ -188,9 +148,23 @@ class ElectraAC {
 
     this.syncInterval = syncInterval
 
+    // TODO - perhaps refactor to a different object (change manager)
     this.pending_changes = {}
     this.pending_changes_mutex = new Mutex() // This is probably not necessary in JS, but easier than finding out
-    this.pending_changes_waker = new Waker()
+    this.pending_changes_event_bus = new EventEmitter()
+
+    this.pending_changes_event_bus.waitFor = async (e) => {
+        let args;
+
+        await new Promise(resolve => {
+            this.pending_changes_event_bus.once(e, (...a) => {
+                resolve()
+                args = a 
+            })
+        })
+
+        return args
+    }
 
     // Start background task for applying changes
     process.nextTick(() => {
@@ -231,7 +205,7 @@ class ElectraAC {
   async syncTask() {
     while (true) {
       // Ideally - condition on some member so we can "cancel" this loop
-      await this.pending_changes_waker.wait() // First wait for wakeup
+      await this.pending_changes_event_bus.waitFor('wake') // First wait for wakeup
       console.trace('syncTask woke up')
       while (true) {
         // We break out when we have no pending changes
@@ -250,6 +224,7 @@ class ElectraAC {
           for (const key of Object.keys(this.pending_changes)) {
             if (newState.OPER[key] === this.pending_changes[key]) {
               console.log(`Update confirmed to ${key}`)
+              this.pending_changes_event_bus.emit('done', key)
               delete this.pending_changes[key]
             }
           }
@@ -273,11 +248,41 @@ class ElectraAC {
   // Queue an incremental change to OPER
   async queueChange(oper_delta) {
     const release = await this.pending_changes_mutex.acquire()
-    console.log('updating pending')
-    this.pending_changes = { ...this.pending_changes, ...oper_delta }
-    release()
-    console.log('calling wake')
-    await this.pending_changes_waker.wake()
+    try {
+        this.pending_changes = { ...this.pending_changes, ...oper_delta }
+    } finally {
+        release()
+    }
+    await this.pending_changes_event_bus.emit('wake')
+
+    return this.waitForChanges(oper_delta)
+}
+  
+  async waitForChanges(oper_delta) {
+    return await Promise.all(Object.keys(oper_delta).map(key => this.waitForChange(key)))
+
+  }
+
+  async waitForChange(key) {
+    let resolve;
+    let p = new Promise(res => resolve = res)
+
+    let random_id = Math.random().toString(36).substring(7)
+    let callback = (changed_key) => {
+        console.log(`${random_id} - invoked for ${changed_key}`)
+        if (changed_key === key) {
+            console.log(`${random_id} - ${key} changed`)
+            resolve()
+        }
+    }
+
+    console.log(`${random_id} - waiting for ${key}`)
+    this.pending_changes_event_bus.on('done', callback)
+        
+    await p
+
+    console.log(`${random_id} - done waiting for ${key}`)
+    this.pending_changes_event_bus.off('done', callback)
   }
 
   // Send an updated OPER state
@@ -318,16 +323,21 @@ class ElectraAC {
 
   async setMode(mode) {
     console.log('Setting mode to ' + mode)
-    if (mode !== 'COOL' && mode !== 'HEAT' && mode !== 'STBY' && mode !== 'DRY') {
+    if (mode !== 'COOL' && mode !== 'HEAT' && mode !== 'STBY' && mode !== 'DRY' && mode !== 'FAN' && mode !== 'AUTO') {
       /// TODO - support other modes? DRY, FAN, AUTO
       throw new SetOperError(`Tried to set invalid AC mode: ${mode}`)
     }
 
-    await this.queueChange({ AC_MODE: mode })
+    const ticket = await this.queueChange({ AC_MODE: mode })
+    await ticket
   }
 
   async turnOff() {
     await this.setMode('STBY')
+  }
+
+  async turnOn() {
+    await this.setMode('COOL') // TODO - add last mode tracking
   }
 
   async setTargetTemperature(temp) {
@@ -336,7 +346,8 @@ class ElectraAC {
       throw new SetOperError(`Tried to set invalid temperature: ${temp}`)
     }
 
-    await this.queueChange({ SPT: temp.toString() })
+    const ticket = await this.queueChange({ SPT: temp.toString() })
+    await ticket
   }
 
   async getTargetTemperature() {
@@ -362,7 +373,8 @@ class ElectraAC {
       throw new SetOperError(`Tried to set invalid fan speed: ${speed}`)
     }
 
-    await this.queueChange({ FANSPD: speed })
+    const ticket = await this.queueChange({ FANSPD: speed })
+    await ticket
   }
 }
 
@@ -384,12 +396,13 @@ async function main() {
   console.log('Current temp is: ' + (await ac.getCurrentTemperature()))
   console.log('Target temp is: ' + (await ac.getTargetTemperature()))
   console.log('Fan speed is: ' + (await ac.getFanSpeed()))
-  await sleep(30000)
+  await sleep(5000)
   console.log('************** AC is off, turning on and setting to med fan, 21 degrees')
-  await ac.setTargetTemperature(21)
-  await sleep(6000)
-  await ac.setMode('COOL')
-  await ac.setFanSpeed('MED')
+  let p1 = ac.setTargetTemperature(21)
+  let p2 = ac.setMode('COOL')
+  let p3 = ac.setFanSpeed('MED')
+  await Promise.all([p1, p2, p3])
+  
   await sleep(30000)
   console.log('************** AC is off, turning on and setting to dry auto fan, 23 degrees')
   await ac.setTargetTemperature(23)
@@ -399,4 +412,5 @@ async function main() {
   await ac.turnOff()
 }
 
-await main()
+
+export { ElectraClient }
