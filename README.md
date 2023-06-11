@@ -1,3 +1,62 @@
+# ElectraKit
+The application requires authentication using OTP.
+To log in:
+```bash
+IMEI=$(echo 2b950000`shuf -rn "8" -i "0-9"  | tr -d "\n"`)
+PHONE_NUMBER=[your phone number]
+curl -X POST \
+  -H "Content-Type: application/json" \
+  -H "User-Agent: Electra Client" \
+  -d '{
+        "pvdid": 1,
+        "id": 99,
+        "cmd": "SEND_OTP",
+        "data": {
+            "imei": "$IMEI",
+            "phone": "$PHONE_NUMBER"
+        }
+    }' \
+  https://app.ecpiot.co.il/mobile/mobilecommand
+```
+
+Wait for the OTP code to arrive, then:
+```bash
+OTP_CODE=[code you got]
+curl -X POST \
+  -H "Content-Type: application/json" \
+  -H "User-Agent: Electra Client" \
+  -d '{
+        "pvdid": 1,
+        "id": 99,
+        "cmd": "CHECK_OTP",
+        "data": {
+            "imei": "$IMEI",
+            "phone": "$PHONE_NUMBER",
+            "code": "$OTP_CODE",
+            "os": "ios",
+            "osver": "16.5",
+        }
+    }' \
+  https://app.ecpiot.co.il/mobile/mobilecommand
+```
+
+And set the token according to the response:
+```bash
+{
+  "id": 99,
+  "status": 0,
+  "desc": null,
+  "data": {
+    "token": "[removed---------]", # <--- this is what you need
+    "sid": "[removed---------]",
+    "res": 0,
+    "res_desc": null
+  }
+}
+```
+
+Then, run in Docker as such:
+
 # API research
 
 Most of my research is based on the code in https://github.com/yonatanp/electrasmart and https://github.com/nitaybz/homebridge-electra-smart.
