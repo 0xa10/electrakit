@@ -26,9 +26,4 @@ class SetOperError extends Error {
   }
 }
 
-export {
-    GetDevicesError,
-    GetLastTelemetryError,
-    DeviceError,
-    SetOperError
-}
+export { GetDevicesError, GetLastTelemetryError, DeviceError, SetOperError }
