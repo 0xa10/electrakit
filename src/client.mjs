@@ -3,24 +3,23 @@ import axios from 'axios'
 import { Mutex } from 'async-mutex'
 import { EventEmitter } from 'events'
 
-import './error.mjs'
+import logger from './logger.mjs'
+import { DeviceError, GetDevicesError, GetLastTelemetryError } from './error.mjs'
 
 const BASE_URL = 'https://app.ecpiot.co.il/'
 
 class ElectraClient {
-  constructor(token, imei) {
-    this.token = token
-    this.imei = imei
+  constructor(options) {
+    this._imei = options.imei
+    this._token = options.token
+    this._retry = options.retry ?? true
 
     this.api = axios.create({
       baseURL: BASE_URL,
       headers: { 'Content-Type': 'application/json', 'User-Agent': 'Electra Client' },
     })
 
-    this.sid = null
-    this.devices = null
-
-    this.retry = true
+    this._sid = null
   }
 
   async getDevices() {
@@ -28,27 +27,29 @@ class ElectraClient {
       pvdid: 1,
       id: 1000,
       cmd: 'GET_DEVICES',
-      sid: this.sid ?? (await this.renewSid()),
+      sid: this._sid ?? (await this.renewSid()),
     }
     let res = await this.api.post('mobile/mobilecommand', payload)
 
-    if (this.retry && res.data.status !== 0) {
+    if (this._retry && res.data.status !== 0) {
+      logger.error('failed to get devices, renewing SID and retrying')
       // If we failed to get devices, renew sid and retry
       payload.sid = await this.renewSid()
       res = await this.api.post('mobile/mobilecommand', payload)
     }
 
+    logger.debug(`GET_DEVICES response: ${JSON.stringify(res.data)}`)
+
     if (res.data.status !== 0) {
-      console.error(res)
-      throw new GetDevicesError('Failed to get devices')
+      throw new GetDevicesError('GET_DEVICES failed')
     }
 
     let devices = res.data.data?.devices
     if (devices === undefined) {
-      throw new GetDevicesError('Unexpected response from server')
+      throw new GetDevicesError('unexpected response from server')
     }
-    this.devices = devices
-    return this.devices
+
+    return devices
   }
 
   async getLastTelemetry(deviceId) {
@@ -60,15 +61,18 @@ class ElectraClient {
         commandName: 'OPER,DIAG_L2',
         id: deviceId,
       },
-      sid: this.sid ?? (await this.renewSid()),
+      sid: this._sid ?? (await this.renewSid()),
     }
     let res = await this.api.post('mobile/mobilecommand', payload)
 
-    if (this.retry && res.data.status !== 0) {
+    if (this._retry && res.data.status !== 0) {
+      logger.error('failed to get devices, renewing SID and retrying')
       // If we failed to get devices, renew sid and retry
       payload.sid = await this.renewSid()
       res = await this.api.post('mobile/mobilecommand', payload)
     }
+
+    logger.debug(`GET_LAST_TELEMETRY response: ${JSON.stringify(res.data)}`)
 
     if (res.data.status !== 0) {
       throw new GetLastTelemetryError('Failed to get devices')
@@ -76,14 +80,16 @@ class ElectraClient {
 
     let oper = res.data.data?.commandJson?.OPER
     if (oper === undefined) {
-      throw new GetLastTelemetryError('Unexpected response from server when parsing OPER object')
+      throw new GetLastTelemetryError('unexpected response from server when parsing OPER object')
     }
 
     let diag_l2 = res.data.data?.commandJson?.DIAG_L2
     if (diag_l2 === undefined) {
-      throw new GetLastTelemetryError('Unexpected response from server when parsing DIAG_L2 object')
+      throw new GetLastTelemetryError('unexpected response from server when parsing DIAG_L2 object')
     }
+
     try {
+        // Save the deserialized JSONs in the state variable
       let oper_parsed = JSON.parse(oper)
       let diag_l2_parsed = JSON.parse(diag_l2)
       return { OPER: oper_parsed.OPER, DIAG_L2: diag_l2_parsed.DIAG_L2 }
@@ -99,34 +105,36 @@ class ElectraClient {
       id: 99,
       cmd: 'VALIDATE_TOKEN',
       data: {
-        imei: this.imei,
-        token: this.token,
+        imei: this._imei,
+        token: this._token,
         os: 'ios',
         osver: '16.5',
       },
     }
 
     let res = await this.api.post('mobile/mobilecommand', payload)
+    logger.debug(`VALIDATE_TOKEN response: ${JSON.stringify(res.data)}`)
 
     const newSid = res.data.data?.sid
-    if (newSid === undefined) {
+    if (newSid === null) {
       throw new Error('Failed to renew sid')
     }
-
-    this.sid = newSid
-    return this.sid
+    
+    logger.info("sucessfully renewed sid")
+    this._sid = newSid
+    return this._sid
   }
 
   async selectDevice(deviceId) {
-    let devices = this.devices ?? (await this.getDevices())
+    let devices = await this.getDevices()
     let device = devices.find(device => device.id === deviceId)
 
     if (device === undefined) {
-      throw new DeviceError('Device not found')
+      throw new DeviceError(`device ${deviceId} not found`)
     }
-    console.log(device)
 
-    return new ElectraAC(this, deviceId, device.sn, device.mac)
+    logger.debug('selected device: ', device)
+    return new ElectraAC(this, deviceId, device)
   }
 }
 
@@ -135,16 +143,15 @@ function sleep(ms) {
 }
 
 class ElectraAC {
-  constructor(client, deviceId, serialNumber, macAddress, stale_duration = 5000, syncInterval = 5000) {
-    this.client = client
+  constructor(client, deviceId, deviceInformation, stateLifetime = 5000, syncInterval = 5000) {
+    this._client = client
     this.deviceId = deviceId
 
-    this.serialNumber = serialNumber
-    this.macAddress = macAddress
+    this.deviceInformation = deviceInformation
 
     this.state = null
-    this.expiration = null
-    this.stale_duration = stale_duration
+    this.stateExpiration = null
+    this.stateLifetime = stateLifetime
 
     this.syncInterval = syncInterval
 
@@ -173,29 +180,24 @@ class ElectraAC {
   }
 
   // Get the current state, or update it if its stale. Force invalidate if requested
-  async getState(invalidate = false) {
-    if (invalidate) {
+  async getState() {
+    if (this.state === null || this.stateExpiration < Date.now()) {
+      console.log("State is stale, updating")
       return await this.updateState()
-    } else {
-      return this.state ?? (await this.updateState())
     }
+    return this.state
   }
 
   // Set the local state, and start a timer to invalidate it
   setState(newState) {
     this.state = newState
-    clearTimeout(this.staleTimer)
-    this.staleTimer = setTimeout(() => {
-      this.state = null
-      console.trace('State expired')
-    }, this.stale_duration)
+    this.stateExpiration = Date.now() + this.stateLifetime
   }
 
   // Read a new state from the server and update the local state
   async updateState() {
-    let upstreamState = await this.client.getLastTelemetry(this.deviceId)
+    let upstreamState = await this._client.getLastTelemetry(this.deviceId)
     console.log('Updating state')
-    console.log(upstreamState)
     this.setState(upstreamState)
     return this.state
   }
@@ -209,7 +211,7 @@ class ElectraAC {
       console.trace('syncTask woke up')
       while (true) {
         // We break out when we have no pending changes
-        let newState = await this.getState(true) // Get a copy of the uncached state
+        let newState = await this.updateState() // Get a copy of the uncached state
         const release = await this.pending_changes_mutex.acquire()
         try {
           // Check if there are any changes to apply
@@ -267,21 +269,16 @@ class ElectraAC {
     let resolve;
     let p = new Promise(res => resolve = res)
 
-    let random_id = Math.random().toString(36).substring(7)
     let callback = (changed_key) => {
-        console.log(`${random_id} - invoked for ${changed_key}`)
         if (changed_key === key) {
-            console.log(`${random_id} - ${key} changed`)
             resolve()
         }
     }
 
-    console.log(`${random_id} - waiting for ${key}`)
     this.pending_changes_event_bus.on('done', callback)
         
     await p
 
-    console.log(`${random_id} - done waiting for ${key}`)
     this.pending_changes_event_bus.off('done', callback)
   }
 
@@ -291,15 +288,15 @@ class ElectraAC {
       pvdid: 1,
       id: 1000,
       cmd: 'SEND_COMMAND',
-      sid: this.client.sid ?? (await this.client.renewSid()),
+      sid: this._client._sid ?? (await this._client.renewSid()),
       data: {
         id: this.deviceId,
         commandJson: JSON.stringify({ OPER: newState.OPER }), // Send only OPER
       },
     }
-    let res = await this.client.api.post('mobile/mobilecommand', payload)
+    let res = await this._client.api.post('mobile/mobilecommand', payload)
 
-    if (this.retry && res.data.status !== 0) {
+    if (this._retry && res.data.status !== 0) {
       // If we failed to get devices, renew sid and retry
       payload.sid = await this.renewSid()
       res = await this.api.post('mobile/mobilecommand', payload)
@@ -385,8 +382,8 @@ async function main() {
   let imei = '2b95000087654322'
   let sid = data.data.sid
   let token = data.data.token
-  let client = new ElectraClient(token, imei)
-  client.sid = sid
+  let client = new ElectraClient({token: token, imei: imei})
+  client._sid = sid
   let devices = await client.getDevices()
   for (let device of devices) {
     console.log('[*] Device: ' + device.name + ' ID: :' + device.id)

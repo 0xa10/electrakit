@@ -1,24 +1,8 @@
 import * as hap from 'hap-nodejs'
-import { createLogger, format, transports } from 'winston'
 import qrcode from 'qrcode-terminal'
 
 import { ElectraClient } from './client.mjs'
-
-const logLevels = {
-  fatal: 0,
-  error: 1,
-  warn: 2,
-  info: 3,
-  debug: 4,
-  trace: 5,
-}
-
-const logger = createLogger({
-  levels: logLevels,
-  level: process.env.LOG_LEVEL ?? 'error',
-  format: format.combine(format.json(), format.timestamp(), format.prettyPrint()),
-  transports: [new transports.Console()],
-})
+import logger from './logger.mjs'
 
 /// application environment variables
 const TOKEN = process.env.TOKEN
@@ -51,7 +35,7 @@ async function main() {
               process.exit()
       }
 
-  const client = new ElectraClient(TOKEN, IMEI)
+  const client = new ElectraClient({token: TOKEN, imei: IMEI})
   const ac = await client.selectDevice(device_id)
 
     logger.info('new connection to target: ' + device_id)
@@ -63,11 +47,11 @@ async function main() {
     // TODO - update fw version and model to correct values
     accessory
       .getService(hap.Service.AccessoryInformation)
-      .setCharacteristic(hap.Characteristic.Manufacturer, 'Electra')
-      .setCharacteristic(hap.Characteristic.Model, 'EMD')
-      .setCharacteristic(hap.Characteristic.Name, ACCESSORY_NAME)
-      .setCharacteristic(hap.Characteristic.SerialNumber, ac.serialNumber)
-      .setCharacteristic(hap.Characteristic.FirmwareRevision, '0.0.1')
+      .setCharacteristic(hap.Characteristic.Manufacturer, ac.deviceInformation.providerName ?? "manufacturer unknown")
+      .setCharacteristic(hap.Characteristic.Model, ac.deviceInformation.model ?? "model unknown")
+      .setCharacteristic(hap.Characteristic.Name, ac.deviceInformation.name ?? "name unknown")
+      .setCharacteristic(hap.Characteristic.SerialNumber, ac.deviceInformation.sn ?? "sn unknown")
+      .setCharacteristic(hap.Characteristic.FirmwareRevision,  ac.deviceInformation.fmVersion ?? "fw unknown")
 
     const heaterCoolerService = new hap.Service.HeaterCooler('AC')
     const fanService = new hap.Service.Fan('Fan')
@@ -289,7 +273,7 @@ async function main() {
     accessory.addService(heaterCoolerService)
     accessory.addService(fanService)
 
-    const fake_mac = parseInt(ac.macAddress, 16) + 0x133d // We change the mac up slightly for the HAP username
+    const fake_mac = parseInt(ac.deviceInformation.mac, 16) + 0x133e // We change the mac up slightly for the HAP username
     const formatted_mac = fake_mac
       .toString(16)
       .padStart(12, '0')
