@@ -53,9 +53,34 @@ And set the token according to the response:
     "res_desc": null
   }
 }
+TOKEN=[token from server]
+SID=[sid from server]
+```
+
+In addition, you'll need to select the correct device id, which you can do using your newly acquired token:
+```bash
+curl -X POST \
+  -H "Content-Type: application/json" \
+  -H "User-Agent: Electra Client" \
+  -d '{
+        "cmd": "GET_DEVICES",
+        "sid": "$SID"
+    }' \
+  https://app.ecpiot.co.il/mobile/mobilecommand \
+    | jq ".data.devices[] | {id, name}"
+
 ```
 
 Then, run in Docker as such:
+```bash
+sudo docker run \
+        --restart unless-stopped \
+        --net=host \
+        -e TOKEN=$TOKEN \
+        -e IMEI=$IMEI \
+        -e DEVICE_ID=$DEVICE_ID \
+    electrakit
+```
 
 # API research
 
@@ -301,7 +326,7 @@ curl -X POST \
   -H "User-Agent: Electra Client" \
   -d '{
         "cmd": "GET_DEVICES",
-        "sid": "123"
+        "sid": "$SID"
     }' \
   https://app.ecpiot.co.il/mobile/mobilecommand
 ```
